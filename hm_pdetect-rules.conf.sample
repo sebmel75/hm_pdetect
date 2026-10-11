@@ -1,0 +1,52 @@
+# hm_pdetect devices and rules
+#
+# This file is read in addition to hm_pdetect.conf (default location: next to
+# hm_pdetect.conf, see HM_RULES_FILE) and re-read in every run, so changes take
+# effect without a restart. On a CCU it is written by the addon settings page,
+# which does not touch hm_pdetect.conf entries.
+# Use plain assignments only (no "declare").
+
+# Number of seconds a user or device must stay unseen before it is reported as
+# away. Bridges short WiFi power-save drop-outs of phones (0 = disabled).
+HM_AWAY_DELAY=600
+
+# Monitored devices (e.g. computers, TVs). They do not count as users and are
+# never reported as guests. For every device the CCU system variable
+# "<HM_CCU_PRESENCE_VAR>.<HM_CCU_PRESENCE_DEVICE>.<Name>" is created
+# (e.g. "Anwesenheit.Geraet.OfficePC").
+# Entries: MAC address, IP address or name:<device name in the FRITZ! device>,
+# several entries separated by spaces. 'name:' entries also work in
+# HM_USER_LIST and help with phones using changing (private) MAC addresses.
+HM_DEVICE_LIST=(
+  [OfficePC]='name:office-pc C9:85:51:8B:06:11'
+)
+
+# Rules: [Name]='condition|actions on enter|actions on leave'
+#
+# The actions of a rule only run when its condition changes (enter/leave).
+# On the first evaluation of a rule (new rule, lost state) only the state is
+# recorded. Rules are evaluated in alphabetical order of their names.
+#
+# Conditions (combine with & = AND, prefix ! = NOT):
+#   device:<Name>   device of HM_DEVICE_LIST is online
+#   user:<Name>     user of HM_USER_LIST is present
+#   anyone          at least one user is present
+#   nobody          nobody is present (guests count as present)
+#
+# Actions (separate several with ;):
+#   temp:<target>=<degC>      heating to manual mode with this temperature
+#   maxtemp:<target>=<degC>   heating to manual mode, at most this temperature
+#                             (lower set points are kept)
+#   auto:<target>             heating back to automatic mode (week profile)
+#   restore                   restore the heating settings saved when the rule
+#                             became active (temp/maxtemp save them)
+#   set:<datapoint>=<value>   set any datapoint, e.g. set:HmIP-RF.0001D3C99C3C93:3.STATE=true
+#   var:<sysvar>=<value>      set a system variable
+#   prog:<program>            execute a CCU program
+#
+# <target> of heating actions: ALL, room:<room name> or comma separated
+# channel names/addresses of HEATING_CLIMATECONTROL_TRANSCEIVER channels.
+HM_RULE_LIST=(
+  [OfficePC_on]='device:OfficePC|temp:room:Office=21|restore'
+  [Nobody_home]='nobody|maxtemp:ALL=18|restore'
+)

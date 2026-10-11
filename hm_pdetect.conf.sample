@@ -42,8 +42,24 @@ HM_PROCESSLOG_FILE=
 # (default: 500 lines)
 HM_PROCESSLOG_MAXLINES="500"
 
-# MAC/IP addresses of user devices
-HM_USER_LIST=([John]=C9:85:51:8B:06:10 [Jane]='06:F7:E4:42:F4:4D 00:27:00:4D:1E:D5')
+# MAC/IP addresses or name:<FRITZ! device name> entries of user devices
+HM_USER_LIST=([John]=C9:85:51:8B:06:10 [Jane]='06:F7:E4:42:F4:4D name:janes-phone')
+
+# file with monitored devices and rules (HM_DEVICE_LIST, HM_RULE_LIST,
+# HM_AWAY_DELAY), see hm_pdetect-rules.conf.sample
+# (default: 'hm_pdetect-rules.conf' next to this config file)
+#HM_RULES_FILE="/opt/hm_pdetect/hm_pdetect-rules.conf"
+
+# directory for the persistent rule state and saved heating settings
+# (default: directory of this config file)
+#HM_STATE_DIR=
+
+# name infix of the system variables of monitored devices
+# (e.g. 'Anwesenheit.Geraet.OfficePC')
+#HM_CCU_PRESENCE_DEVICE="Geraet"
+
+# only log the actions of rules instead of sending them to the CCU
+#HM_RULES_DRYRUN=false
 
 # Specify mode of HM_KNOWN_LIST variable setting
 #

@@ -1,6 +1,7 @@
 #!/bin/tclsh
 source inc/settings.tcl
 source inc/session.tcl
+set PAGE_LANG "en"
 
 puts "Content-Type: text/html; charset=utf-8"
 puts ""
@@ -35,7 +36,12 @@ if {[info exists sid] && [check_session $sid]} {
     set args(command) "save"
   }
 
+  set rulesKeep 0
   if { $args(command) == "save" } {
+    # the rule editor fields are only present when RULES_FORM was sent
+    if { $args(RULES_FORM) == "1" && ![saveRulesFile] } {
+      set rulesKeep 1
+    }
     saveConfigFile
   }
 
@@ -61,6 +67,12 @@ if {[info exists sid] && [check_session $sid]} {
   set HM_INTERVAL_TIME ""
 
   loadConfigFile
+  if { !$rulesKeep } {
+    loadRulesFile
+  }
+  set RULES_INFO [targetsHtml]
+  set STATUS_HTML [statusHtml]
+  set RULES_DATA [rulesDataScript]
 
   set content [subst {
     <html lang="en">
@@ -79,6 +91,11 @@ if {[info exists sid] && [check_session $sid]} {
       <link href="css/custombootstrap.css" rel="stylesheet">
       <link href="css/custom.css" rel="stylesheet">
       <title>HM-pdetect Addon</title>
+      <style>
+        details.cfg { border:1px solid #ddd; border-radius:4px; margin-bottom:10px; background:#fff; }
+        details.cfg > summary { cursor:pointer; padding:8px 12px; font-weight:bold; background:#f5f5f5; border-radius:4px; }
+        details.cfg\[open\] > summary { border-bottom:1px solid #ddd; border-radius:4px 4px 0 0; margin-bottom:12px; }
+      </style>
     </head>
     <body  style="zoom: 1; margin-top: 60px;">
     <div class="navbar navbar-default navbar-fixed-top" role="navigation">
@@ -112,26 +129,15 @@ if {[info exists sid] && [check_session $sid]} {
     <form class='form-horizontal' name='f_edit' id='f_edit' action="en.settings.cgi?sid=$sid" method="post">
     <fieldset>
 
-    <!-- Text input-->
-    <div class="form-group">
-      <label class="col-md-3 control-label" for="HM_FRITZ_IP" id="HM_FRITZ_IP-Label">FRITZ! Hostnames/IPs:</label>
-      <div class="col-md-4">
-      <input id="HM_FRITZ_IP" name="HM_FRITZ_IP" type="text" placeholder="e.g. 'fritz.box fritz.repeater'" class="form-control input-md" value="<%HM_FRITZ_IP%>">
-      <span class="help-block">Default: 'fritz.box fritz.repeater'</span>
-      </div>
+    <%RULES_MSG%>
+    <%STATUS%>
+    <details class="cfg" open><summary>Users and guests</summary>
+    <div class="editor-only" style="display:none;padding:0 15px;margin-bottom:15px">
+      <h4 style="margin-top:18px">Users</h4>
+      <p class="help-block">Choose the device (e.g. phone) of each user from the list of FRITZ! devices. Its MAC address is stored automatically.</p>
+      <div id="user-editor"></div>
     </div>
-    <!-- Text input-->
-    <div class="form-group">
-      <label class="col-md-3 control-label" for="HM_FRITZ_USER" id="HM_FRITZ_USER-Label">FRITZ! Login Credentials:</label>
-      <div class="col-md-4">
-      <input id="HM_FRITZ_USER" name="HM_FRITZ_USER" type="text" placeholder="Username" class="form-control input-md" value="<%HM_FRITZ_USER%>">
-      <span class="help-block">Default: empty (no username required)</span>
-      </div>
-      <div class="col-md-3">
-      <input id="HM_FRITZ_SECRET" name="HM_FRITZ_SECRET" type="password" placeholder="Password" class="form-control input-md" value="<%HM_FRITZ_SECRET%>">
-      <span class="help-block">Default: empty (no password required)</span>
-      </div>
-    </div>
+    <div class="expert-only">
     <!-- Text area-->
     <div class="form-group">
       <label class="col-md-3 control-label" for="HM_USER_LIST" id="HM_USER_LIST-Label">Unique user devices<br>(MAC/IP-List):</label>
@@ -139,6 +145,7 @@ if {[info exists sid] && [check_session $sid]} {
         <textarea id="HM_USER_LIST" name="HM_USER_LIST" type="text" rows="4" placeholder="e.g. \[John\]=AA:BB:CC:DD:EE:FF \[Jane\]='192.168.178.10 192.168.178.20'" class="form-control input-md"><%HM_USER_LIST%></textarea>
         <span class="help-block">Default: empty (no user devices configured)</span>
       </div>
+    </div>
     </div>
     <!-- Text input-->
     <div class="form-group">
@@ -159,7 +166,75 @@ if {[info exists sid] && [check_session $sid]} {
         <span class="help-block">Default: '192.168.179.*'</span>
       </div>
     </div>
-    <br>
+    </details>
+    <details class="cfg" open><summary>Devices &amp; rules</summary>
+    <p class="help-block" style="padding:0 15px">Controls CCU devices depending on who or what is in the network. Stored in a separate file and applied without restart in the next run.</p>
+    <input type="hidden" name="RULES_FORM" value="1">
+    <div class="form-group">
+      <label class="col-md-3 control-label" for="HM_AWAY_DELAY">Away delay (s):</label>
+      <div class="col-md-4">
+        <input id="HM_AWAY_DELAY" name="HM_AWAY_DELAY" type="number" min="0" max="86400" step="1" class="form-control input-md" value="<%HM_AWAY_DELAY%>">
+        <span class="help-block">Users and devices count as away only after not being seen for this long (bridges short WiFi drop-outs). Recommended: 600</span>
+      </div>
+    </div>
+    <div class="editor-only" style="display:none;padding:0 15px;margin-bottom:15px">
+      <h4 style="margin-top:18px">Monitored devices</h4>
+      <p class="help-block">Devices do not count as users. Each device gets the variable &lt;variable prefix&gt;.Geraet.&lt;Name&gt;.</p>
+      <div id="device-editor"></div>
+    </div>
+    <div class="editor-only" style="display:none;padding:0 15px;margin-bottom:15px">
+      <h4 style="margin-top:18px">Rules</h4>
+      <p class="help-block">Actions only run when the condition changes. If several rules control the same heating, the alphabetically last one wins.</p>
+      <div id="rule-editor"></div>
+    </div>
+    <div class="expert-only">
+    <div class="form-group">
+      <label class="col-md-3 control-label" for="HM_DEVICE_LIST">Monitored devices:</label>
+      <div class="col-md-8">
+        <textarea id="HM_DEVICE_LIST" name="HM_DEVICE_LIST" rows="3" spellcheck="false" wrap="off" style="font-family:monospace" class="form-control input-md"><%HM_DEVICE_LIST%></textarea>
+        <span class="help-block">One line per device: <code>Name = entries</code> (MAC, IP or <code>name:&lt;FRITZ! device name&gt;</code>).</span>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="col-md-3 control-label" for="HM_RULE_LIST">Rules:</label>
+      <div class="col-md-8">
+        <textarea id="HM_RULE_LIST" name="HM_RULE_LIST" rows="6" spellcheck="false" wrap="off" style="font-family:monospace" class="form-control input-md"><%HM_RULE_LIST%></textarea>
+        <span class="help-block">One line per rule: <code>Name | condition | actions on enter | actions on leave</code>. Conditions: <code>device:&lt;Name&gt;</code>, <code>user:&lt;Name&gt;</code>, <code>anyone</code>, <code>nobody</code> (combine with <code>&amp;</code>, <code>!</code> negates). Actions (separate with <code>;</code>): <code>temp:&lt;target&gt;=&lt;°C&gt;</code>, <code>maxtemp:&lt;target&gt;=&lt;°C&gt;</code>, <code>auto:&lt;target&gt;</code>, <code>restore</code>, <code>set:&lt;datapoint&gt;=&lt;value&gt;</code>, <code>var:&lt;system variable&gt;=&lt;value&gt;</code>, <code>prog:&lt;program&gt;</code>. Targets: <code>ALL</code>, <code>room:&lt;room&gt;</code> or comma separated channel names.</span>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="col-md-3 control-label">Possible targets:</label>
+      <div class="col-md-8"><%RULES_INFO%></div>
+    </div>
+    </div>
+    <div class="form-group">
+      <label class="col-md-3 control-label"></label>
+      <div class="col-md-8"><label class="checkbox-inline"><input type="checkbox" id="expert-toggle"> Text view (advanced)</label></div>
+    </div>
+    </details>
+    <details class="cfg"><summary>FRITZ! access</summary>
+    <!-- Text input-->
+    <div class="form-group">
+      <label class="col-md-3 control-label" for="HM_FRITZ_IP" id="HM_FRITZ_IP-Label">FRITZ! Hostnames/IPs:</label>
+      <div class="col-md-4">
+      <input id="HM_FRITZ_IP" name="HM_FRITZ_IP" type="text" placeholder="e.g. 'fritz.box fritz.repeater'" class="form-control input-md" value="<%HM_FRITZ_IP%>">
+      <span class="help-block">Default: 'fritz.box fritz.repeater'</span>
+      </div>
+    </div>
+    <!-- Text input-->
+    <div class="form-group">
+      <label class="col-md-3 control-label" for="HM_FRITZ_USER" id="HM_FRITZ_USER-Label">FRITZ! Login Credentials:</label>
+      <div class="col-md-4">
+      <input id="HM_FRITZ_USER" name="HM_FRITZ_USER" type="text" placeholder="Username" class="form-control input-md" value="<%HM_FRITZ_USER%>">
+      <span class="help-block">Default: empty (no username required)</span>
+      </div>
+      <div class="col-md-3">
+      <input id="HM_FRITZ_SECRET" name="HM_FRITZ_SECRET" type="password" placeholder="Password" class="form-control input-md" value="<%HM_FRITZ_SECRET%>">
+      <span class="help-block">Default: empty (no password required)</span>
+      </div>
+    </div>
+    </details>
+    <details class="cfg"><summary>Execution</summary>
     <!-- Text input-->
     <div class="form-group">
       <label class="col-md-3 control-label" for="HM_INTERVAL_TIME" id="HM_INTERVAL_TIME-Label">Automatic Execution:</label>
@@ -168,10 +243,8 @@ if {[info exists sid] && [check_session $sid]} {
         <span class="help-block">Default: 15s (Execution every 15 seconds)</span>
       </div>
     </div>
-    <!-- Separator-->
-    <div class="form-group">
-      <label class="col-md-3 control-label"><u>CCU Variable Settings</u></label>
-    </div>
+    </details>
+    <details class="cfg"><summary>CCU variables</summary>
     <!-- Text input-->
     <div class="form-group">
       <label class="col-md-3 control-label" for="HM_CCU_PRESENCE_VAR" id="HM_CCU_PRESENCE_VAR-Label">Variableprefix:</label>
@@ -242,6 +315,7 @@ if {[info exists sid] && [check_session $sid]} {
         <span class="help-block">Default: 'string' (Anwesenheit.string)</span>
       </div>
     </div>
+    </details>
     <!-- Button -->
     <div class="form-group">
       <label class="control-label col-md-3" for="button1id"> </label>
@@ -283,6 +357,11 @@ if {[info exists sid] && [check_session $sid]} {
       scale: 'logarithmic',
     });
 
+    // a slider initialised inside a collapsed section has no width until relayout
+    \$('details.cfg').on('toggle', function() {
+      try { \$('#HM_INTERVAL_TIME').slider('relayout'); } catch (e) {}
+    });
+
     function check () {
       \$('#HM_FRITZ_IP').val("");
       \$('#HM_FRITZ_USER').val("");
@@ -307,6 +386,8 @@ if {[info exists sid] && [check_session $sid]} {
       \$('#HM_CCU_PRESENCE_AWAY').val("");
     }
     </script>
+    <%RULES_DATA%>
+    <script src="js/rules-editor.js" charset="utf-8"></script>
     </body>
     </html>
   }]

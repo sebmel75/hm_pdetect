@@ -102,6 +102,26 @@ HM_PROCESSLOG_MAXLINES=${HM_PROCESSLOG_MAXLINES:-500}
 # (default: 'hm_pdetect.conf' in path where hm_pdetect.sh script resists)
 CONFIG_FILE=${CONFIG_FILE:-"$(realpath "$(dirname "${BASH_SOURCE[0]}")")/hm_pdetect.conf"}
 
+# separate file holding HM_DEVICE_LIST/HM_RULE_LIST, kept apart from
+# CONFIG_FILE because the addon settings page rewrites CONFIG_FILE
+# (default: 'hm_pdetect-rules.conf' next to CONFIG_FILE)
+HM_RULES_FILE=${HM_RULES_FILE:-}
+
+# seconds a user/device must stay unseen before it is reported as away
+# (bridges short WiFi power-save drop-outs of phones; 0=disabled)
+HM_AWAY_DELAY=${HM_AWAY_DELAY:-0}
+
+# name infix of the CCU variables for monitored devices
+# (results in e.g. 'Anwesenheit.Geraet.BueroPC')
+HM_CCU_PRESENCE_DEVICE=${HM_CCU_PRESENCE_DEVICE:-"Geraet"}
+
+# directory for persistent rule state (rule on/off + saved heating settings)
+# (default: directory of CONFIG_FILE)
+HM_STATE_DIR=${HM_STATE_DIR:-}
+
+# if true, rule actions are only logged but not sent to the CCU
+HM_RULES_DRYRUN=${HM_RULES_DRYRUN:-false}
+
 # global return status variables
 RETURN_FAILURE=1
 RETURN_SUCCESS=0
@@ -138,8 +158,15 @@ fi
 
 # declare all associative arrays first (bash v4+ required)
 declare -A HM_USER_LIST     # username<>MAC/IP tuple
+declare -A HM_DEVICE_LIST   # devicename<>MAC/IP/name: tuple
+declare -A HM_RULE_LIST     # rulename<>'condition|enter actions|leave actions'
 declare -A normalDeviceList # MAC<>IP tuple (normal-WiFi/LAN)
 declare -A guestDeviceList  # MAC<>IP tuple (guest-WiFi/LAN)
+declare -A activeNameList   # uppercased FRITZ! device name<>MAC (all active devices)
+declare -A userState        # username<>true/false (after away delay)
+declare -A deviceState      # devicename<>true/false (after away delay)
+declare -A lastSeenList     # 'user:X'/'device:X'<>epoch of last sighting
+fritzDeviceLines=()         # 'name|ip|mac|active|guest' of all devices known to the FRITZ! devices
 
 ###############################
 # lets check if config file was specified as a cmdline arg
@@ -166,6 +193,33 @@ if [[ -n ${CONFIG_FILE} ]]; then
   # lets eval the user overridden variables
   # so that they take priority
   eval "${USERVARS}"
+fi
+
+# function sourcing the separate rules file (HM_DEVICE_LIST, HM_RULE_LIST, ...)
+function sourceRulesFile()
+{
+  local cfgdir="."
+  if [[ -n ${CONFIG_FILE} ]]; then
+    cfgdir=$(dirname "${CONFIG_FILE}")
+  fi
+  RULES_FILE=${HM_RULES_FILE:-"${cfgdir}/hm_pdetect-rules.conf"}
+  STATE_DIR=${HM_STATE_DIR:-"${cfgdir}"}
+
+  # start from empty lists so that removed entries really disappear
+  HM_DEVICE_LIST=()
+  HM_RULE_LIST=()
+  if [[ -e ${RULES_FILE} ]]; then
+    if ! source "${RULES_FILE}"; then
+      echo "ERROR: couldn't source rules file '${RULES_FILE}'. Please check its syntax."
+      return ${RETURN_FAILURE}
+    fi
+    eval "${USERVARS}"
+  fi
+  return ${RETURN_SUCCESS}
+}
+
+if ! sourceRulesFile; then
+  exit ${RETURN_FAILURE}
 fi
 
 ###############################
@@ -530,11 +584,16 @@ function retrieveFritzBoxDeviceList()
     # which should signal that we have parsed all parameters of a device
     if [[ $line =~ .*}.* ]]; then
       if [[ -n $ipaddr ]]; then
+        # complete list (incl. inactive devices) for the settings page
+        fritzDeviceLines+=("${name//|/_}|${ipaddr}|${mac^^}|${active}|${guest}")
         # DEBUG: output name+speed+active for debugging purposes
         #echo -n "${name}: ${active} @ ${speed} - wlan: ${wlan} - "
 
         # only add 'active' devices
         if [[ ${active} -eq 1 ]]; then
+          if [[ -n ${name} ]]; then
+            activeNameList[${name^^}]="${mac^^}"
+          fi
           if [[ ${guest} -eq 1 ]] || [[ ${ipaddr} =~ ${HM_CCU_PRESENCE_GUEST_IPRANGE} ]]; then
             maclist_guest+=("${mac^^}") # add uppercased mac address
             iplist_guest+=("${ipaddr}")
@@ -682,6 +741,436 @@ function whichEnumID()
   echo ${result}
 }
 
+# replaces 'name:<FRITZ! device name>' entries of a space separated device
+# list by the MAC address of the currently active device carrying that name
+function resolveDeviceEntries()
+{
+  local out=""
+  local e=""
+  for e in ${1}; do
+    if [[ ${e,,} == name:* ]]; then
+      local n="${e#*:}"
+      if [[ -n ${activeNameList[${n^^}]} ]]; then
+        e="${activeNameList[${n^^}]}"
+      fi
+    fi
+    out+="${out:+ }${e}"
+  done
+  echo "${out}"
+}
+
+# returns success if any MAC/IP/name: entry of the space separated list
+# is currently active in the normal or guest WiFi/LAN (exact match)
+function isDeviceOnline()
+{
+  local e=""
+  local d=""
+  for e in $(resolveDeviceEntries "${1}"); do
+    e="${e^^}"
+    if [[ -n ${normalDeviceList[${e}]+x} || -n ${guestDeviceList[${e}]+x} ]]; then
+      return ${RETURN_SUCCESS}
+    fi
+    for d in "${normalDeviceList[@]}" "${guestDeviceList[@]}"; do
+      if [[ ${d} == "${e}" ]]; then
+        return ${RETURN_SUCCESS}
+      fi
+    done
+  done
+  return ${RETURN_FAILURE}
+}
+
+# removes a single MAC/IP address from the normal/guest device lists so
+# that it is not recognized as a guest device
+function removeFromDeviceLists()
+{
+  local device="${1^^}"
+  local dev=""
+  unset "normalDeviceList[${device}]" "guestDeviceList[${device}]"
+  for dev in "${!normalDeviceList[@]}"; do
+    if [[ ${normalDeviceList[${dev}]} == "${device}" ]]; then
+      unset "normalDeviceList[${dev}]"
+    fi
+  done
+  for dev in "${!guestDeviceList[@]}"; do
+    if [[ ${guestDeviceList[${dev}]} == "${device}" ]]; then
+      unset "guestDeviceList[${dev}]"
+    fi
+  done
+}
+
+# last-seen timestamps are kept in a file because run_pdetect is executed
+# in a subshell when logging to HM_PROCESSLOG_FILE
+LASTSEEN_FILE="/tmp/hm_pdetect-lastseen"
+
+function loadLastSeen()
+{
+  lastSeenList=()
+  local k=""
+  local v=""
+  if [[ -r ${LASTSEEN_FILE} ]]; then
+    while read -r k v; do
+      if [[ -n ${k} ]]; then
+        lastSeenList[${k}]="${v}"
+      fi
+    done <"${LASTSEEN_FILE}"
+  fi
+}
+
+function saveLastSeen()
+{
+  local k=""
+  (umask 077
+   for k in "${!lastSeenList[@]}"; do
+     echo "${k} ${lastSeenList[${k}]}"
+   done >"${LASTSEEN_FILE}")
+}
+
+# sets PRESENCE_RESULT to 'true' if the user/device identified by key is
+# online or was last seen less than HM_AWAY_DELAY seconds ago, else 'false'.
+# Must not be called in a $(...) subshell, it updates lastSeenList.
+function presentWithDelay()
+{
+  local key="${1// /_}"
+  local online="$2"
+  local now=""
+  now=$(date +%s)
+  if [[ ${online} == true ]]; then
+    lastSeenList[${key}]=${now}
+    PRESENCE_RESULT=true
+  elif [[ ${HM_AWAY_DELAY} -gt 0 && -n ${lastSeenList[${key}]} &&           $((now - lastSeenList[${key}])) -lt ${HM_AWAY_DELAY} ]]; then
+    PRESENCE_RESULT=true
+  else
+    PRESENCE_RESULT=false
+  fi
+}
+
+# sends a HomeMatic script to the CCU and echos its output (everything
+# the script writes via Write() before the trailing <xml> block)
+function regaRun()
+{
+  local script="$1"
+  local body=""
+  # the CCU expects ISO-8859-1; keep the script as is if it is not valid UTF-8
+  if ! body=$(printf '%s' "${script}" | iconv -f UTF-8 -t ISO-8859-1 2>/dev/null); then
+    body="${script}"
+  fi
+  local result=""
+  result=$(wget -T 15 -t 1 -q -O - --post-data "${body}" "http://${HM_CCU_IP}:${HM_CCU_REGAPORT}/tclrega.exe")
+  echo "${result%%<xml>*}"
+}
+
+# evaluates a rule condition: terms separated by '&' (all must be true),
+# each optionally prefixed by '!': device:<name>, user:<name>, anyone, nobody
+function evalCondition()
+{
+  local cond="$1"
+  local term=""
+  local neg=""
+  local res=""
+  local IFS='&'
+  for term in ${cond}; do
+    term="${term#"${term%%[![:space:]]*}"}"
+    term="${term%"${term##*[![:space:]]}"}"
+    neg=false
+    if [[ ${term} == '!'* ]]; then
+      neg=true
+      term="${term:1}"
+    fi
+    res=false
+    case "${term,,}" in
+      device:*) [[ ${deviceState[${term#*:}]} == true ]] && res=true ;;
+      user:*)   [[ ${userState[${term#*:}]} == true ]] && res=true ;;
+      anyone)   [[ -n ${presenceList} ]] && res=true ;;
+      nobody)   [[ -z ${presenceList} ]] && res=true ;;
+      *)
+        echo -n " [unknown condition '${term}']"
+        return ${RETURN_FAILURE}
+      ;;
+    esac
+    if [[ ${neg} == true ]]; then
+      if [[ ${res} == true ]]; then res=false; else res=true; fi
+    fi
+    if [[ ${res} == false ]]; then
+      return ${RETURN_FAILURE}
+    fi
+  done
+  return ${RETURN_SUCCESS}
+}
+
+# builds the HomeMatic script that applies a heating action to all
+# HEATING_CLIMATECONTROL_TRANSCEIVER channels matching the target.
+# mode: 1=manual temp, 2=manual but at most temp, 0=auto, -1=only list matches
+# Every channel switched to manual mode reports its previous state as
+# 'SAVE:<channel id>|<set point mode>|<set point temp>'.
+function heatingScript()
+{
+  local ttype="$1"
+  local targ="${2//\"/}"
+  local mode="$3"
+  local temp="$4"
+  cat <<EOF
+string sType = "${ttype}"; string sArg = "${targ}"; integer iMode = ${mode}; real rT = ${temp};
+string sRoomIDs = "";
+if (sType == "ROOM") { object oR = dom.GetObject(ID_ROOMS).Get(sArg); if (oR) { sRoomIDs = "\t" # oR.EnumUsedIDs() # "\t"; } }
+string sList = "," # sArg # ",";
+string sId; integer iCnt = 0;
+foreach (sId, dom.GetObject(ID_CHANNELS).EnumUsedIDs()) {
+  object ch = dom.GetObject(sId);
+  if (ch.HssType() == "HEATING_CLIMATECONTROL_TRANSCEIVER") {
+    boolean bHit = false;
+    if (sType == "ALL") { bHit = true; }
+    if ((sType == "ROOM") && (sRoomIDs.Find("\t" # sId # "\t") >= 0)) { bHit = true; }
+    if ((sType == "LIST") && ((sList.Find("," # ch.Name() # ",") >= 0) || (sList.Find("," # ch.Address() # ",") >= 0))) { bHit = true; }
+    if (bHit) {
+      object oSp = ch.DPByHssDP("SET_POINT_TEMPERATURE");
+      object oSm = ch.DPByHssDP("SET_POINT_MODE");
+      object oCm = ch.DPByHssDP("CONTROL_MODE");
+      if (oSp && oCm) {
+        real rCur = oSp.Value();
+        integer iCurMode = 0;
+        if (oSm) { iCurMode = oSm.Value(); }
+        if (iMode == 0) { oCm.State(0); }
+        if (iMode > 0) {
+          real rNeu = rT;
+          if ((iMode == 2) && (rCur >= 4.5) && (rCur < rT)) { rNeu = rCur; }
+          Write("SAVE:" # sId # "|" # iCurMode # "|" # rCur.ToString(1) # "\n");
+          oCm.State(1);
+          oSp.State(rNeu);
+        }
+        Write("OK:" # ch.Name() # " (" # rCur.ToString(1) # " -> mode " # iMode # ")\n");
+        iCnt = iCnt + 1;
+      }
+    }
+  }
+}
+Write("COUNT:" # iCnt # "\n");
+EOF
+}
+
+# script restoring heating channels from a tab separated list of
+# '<channel id>|<set point mode>|<set point temp>' entries
+function restoreScript()
+{
+  cat <<EOF
+string sL = "$1"; string sE;
+foreach (sE, sL) {
+  object ch = dom.GetObject(sE.StrValueByIndex("|", 0));
+  if (ch) {
+    object oCm = ch.DPByHssDP("CONTROL_MODE");
+    object oSp = ch.DPByHssDP("SET_POINT_TEMPERATURE");
+    if (sE.StrValueByIndex("|", 1) == "1") { oCm.State(1); oSp.State(sE.StrValueByIndex("|", 2).ToFloat()); }
+    else { oCm.State(0); }
+    Write("OK:" # ch.Name() # " restored\n");
+  }
+}
+EOF
+}
+
+# formats a value for a HomeMatic script (numbers/booleans raw, rest quoted)
+function regaValue()
+{
+  local v="$1"
+  if [[ ${v} =~ ^-?[0-9]+(\.[0-9]+)?$ || ${v,,} == true || ${v,,} == false ]]; then
+    echo "${v,,}"
+  else
+    echo "\"${v//\"/}\""
+  fi
+}
+
+# executes the ';' separated actions of a rule:
+#   temp:<target>=<degC>     heating to manual mode with given temperature
+#   maxtemp:<target>=<degC>  heating to manual mode, at most given temperature
+#   auto:<target>            heating back to automatic (week profile) mode
+#   restore                  restore heating settings saved when the rule became active
+#   set:<datapoint>=<value>  set any datapoint, e.g. set:HmIP-RF.00021709AECCAD:3.STATE=true
+#   var:<sysvar>=<value>     set a system variable
+#   prog:<program>           execute a CCU program
+# <target>: ALL, room:<room name> or comma separated channel names/addresses
+function runRuleActions()
+{
+  local rule="$1"
+  local actions="$2"
+  local phase="$3"
+  local saveFile="${STATE_DIR}/hm_pdetect-rule-${rule//[^A-Za-z0-9_-]/_}.save"
+  local dry=false
+  if [[ ${HM_RULES_DRYRUN} == true ]]; then
+    dry=true
+  elif [[ ${phase} == enter ]]; then
+    rm -f "${saveFile}"
+  fi
+
+  local action=""
+  local -a actionList=()
+  IFS=';' read -r -a actionList <<<"${actions}"
+  for action in "${actionList[@]}"; do
+    action="${action#"${action%%[![:space:]]*}"}"
+    action="${action%"${action##*[![:space:]]}"}"
+    if [[ -z ${action} ]]; then
+      continue
+    fi
+    local type="${action%%:*}"
+    local arg=""
+    if [[ ${action} == *:* ]]; then
+      arg="${action#*:}"
+    fi
+    echo -n "  ${action}"
+    if [[ ${dry} == true ]]; then
+      echo -n " [dry-run]"
+    fi
+
+    local out=""
+    case "${type,,}" in
+      temp|maxtemp|auto)
+        local target="${arg}"
+        local value="0"
+        local mode=0
+        if [[ ${type,,} != auto ]]; then
+          target="${arg%=*}"
+          value="${arg##*=}"
+          value="${value/,/.}"
+          if [[ ${arg} != *=* || ! ${value} =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo ": ERROR: expected ${type}:<target>=<temperature>"
+            continue
+          fi
+          mode=1
+          if [[ ${type,,} == maxtemp ]]; then mode=2; fi
+        fi
+        local ttype="LIST"
+        local targ="${target}"
+        if [[ ${target^^} == ALL ]]; then
+          ttype="ALL"
+        elif [[ ${target,,} == room:* ]]; then
+          ttype="ROOM"
+          targ="${target#*:}"
+        fi
+        if [[ ${dry} == true ]]; then
+          mode=-1
+        fi
+        out=$(regaRun "$(heatingScript "${ttype}" "${targ}" "${mode}" "${value}")")
+        if [[ ${dry} == false ]]; then
+          echo "${out}" | grep '^SAVE:' | cut -d: -f2- >>"${saveFile}"
+        fi
+      ;;
+      restore)
+        if [[ ! -s ${saveFile} ]]; then
+          echo ": nothing saved"
+          continue
+        fi
+        local list=""
+        list=$(tr '\n' '\t' <"${saveFile}")
+        list="${list%$'\t'}"
+        if [[ ${dry} == true ]]; then
+          out="would restore: ${list//$'\t'/, }"
+        else
+          out=$(regaRun "$(restoreScript "${list}")")
+          rm -f "${saveFile}"
+        fi
+      ;;
+      set|var)
+        local name="${arg%%=*}"
+        local val=""
+        val=$(regaValue "${arg#*=}")
+        local obj="dom.GetObject(\"${name//\"/}\")"
+        if [[ ${type,,} == var ]]; then
+          obj="dom.GetObject(ID_SYSTEM_VARIABLES).Get(\"${name//\"/}\")"
+        fi
+        if [[ ${dry} == true ]]; then
+          out=$(regaRun "object o = ${obj}; if (o) { Write(\"OK:found\"); } else { Write(\"ERROR:not found\"); }")
+        else
+          out=$(regaRun "object o = ${obj}; if (o) { o.State(${val}); Write(\"OK:set\"); } else { Write(\"ERROR:not found\"); }")
+        fi
+      ;;
+      prog)
+        local obj="dom.GetObject(ID_PROGRAMS).Get(\"${arg//\"/}\")"
+        if [[ ${dry} == true ]]; then
+          out=$(regaRun "object o = ${obj}; if (o) { Write(\"OK:found\"); } else { Write(\"ERROR:not found\"); }")
+        else
+          out=$(regaRun "object o = ${obj}; if (o) { o.ProgramExecute(); Write(\"OK:executed\"); } else { Write(\"ERROR:not found\"); }")
+        fi
+      ;;
+      *)
+        echo ": ERROR: unknown action type '${type}'"
+        continue
+      ;;
+    esac
+    if [[ -z ${out} ]]; then
+      echo ": ERROR: no answer from CCU"
+    else
+      echo ":"
+      echo "${out}" | grep -v '^SAVE:' | sed 's/^/    /'
+    fi
+  done
+}
+
+# evaluates all HM_RULE_LIST entries ('condition|enter actions|leave actions')
+# in alphabetical order and runs the enter/leave actions whenever the
+# condition of a rule changes. Rule state survives restarts in STATE_DIR.
+function evaluateRules()
+{
+  if [[ ${#HM_RULE_LIST[@]} -eq 0 ]]; then
+    return ${RETURN_SUCCESS}
+  fi
+
+  local stateFile="${STATE_DIR}/hm_pdetect-rules.state"
+  local -A ruleState=()
+  local k=""
+  local v=""
+  if [[ -r ${stateFile} ]]; then
+    while IFS='=' read -r k v; do
+      if [[ -n ${k} ]]; then
+        ruleState[${k}]="${v}"
+      fi
+    done <"${stateFile}"
+  fi
+
+  local -A newState=()
+  local changed=false
+  local rule=""
+  echo "Checking rules:"
+  while IFS= read -r rule; do
+    local cond=""
+    local enter=""
+    local leave=""
+    IFS='|' read -r cond enter leave <<<"${HM_RULE_LIST[${rule}]}"
+    local cur=0
+    echo -n " ${rule} (${cond}):"
+    if evalCondition "${cond}"; then
+      cur=1
+      echo -n " true"
+    else
+      echo -n " false"
+    fi
+    local key="${rule//[^A-Za-z0-9_-]/_}"
+    local prev="${ruleState[${key}]}"
+    newState[${key}]=${cur}
+    if [[ ${prev} == "${cur}" ]]; then
+      echo
+    elif [[ -z ${prev} ]]; then
+      # first evaluation (new rule or lost state): only record the state
+      echo " (initial state, no action)"
+      changed=true
+    elif [[ ${cur} -eq 1 ]]; then
+      echo " -> enter"
+      runRuleActions "${rule}" "${enter}" enter
+      changed=true
+    else
+      echo " -> leave"
+      runRuleActions "${rule}" "${leave}" leave
+      changed=true
+    fi
+  done < <(printf '%s\n' "${!HM_RULE_LIST[@]}" | sort)
+
+  if [[ ${#newState[@]} -ne ${#ruleState[@]} ]]; then
+    changed=true
+  fi
+  if [[ ${changed} == true && ${HM_RULES_DRYRUN} != true ]]; then
+    for k in "${!newState[@]}"; do
+      echo "${k}=${newState[${k}]}"
+    done >"${stateFile}"
+  fi
+  return ${RETURN_SUCCESS}
+}
+
 function run_pdetect()
 {
   # output time/date of execution
@@ -707,6 +1196,11 @@ function run_pdetect()
     return ${RETURN_FAILURE}
   fi
 
+  # device list for the settings page (written atomically, readable for the webserver)
+  (umask 022
+   printf '%s\n' "${fritzDeviceLines[@]}" >"/tmp/hm_pdetect-devices.tmp" && \
+     mv -f "/tmp/hm_pdetect-devices.tmp" "/tmp/hm_pdetect-devices")
+
   # output some statistics
   echo
   echo " Normal-WiFi/LAN devices active: ${#normalDeviceList[@]}"
@@ -714,25 +1208,27 @@ function run_pdetect()
   
   # lets identify user presence
   presenceList=""
+  loadLastSeen
   echo "Checking user presence: "
   # shellcheck disable=SC2068
   for user in ${!HM_USER_LIST[@]}; do
     echo -n " ${user}: "
-    stat="false"
-  
-    # prepare the device list of the user as a regex
-    userDeviceList=$(echo "${HM_USER_LIST[${user}]}" | tr ' ' '|')
+    online="false"
 
-    # match MAC address and IP address in normal and guest WiFi/LAN
-    if [[ ${normalDeviceList[*]}  =~ ${userDeviceList^^} || \
-          ${guestDeviceList[*]}   =~ ${userDeviceList^^} || \
-          ${!normalDeviceList[*]} =~ ${userDeviceList^^} || \
-          ${!guestDeviceList[*]}  =~ ${userDeviceList^^} ]]; then
-      stat="true"
+    # match MAC address, IP address or FRITZ! device name in normal and guest WiFi/LAN
+    if isDeviceOnline "${HM_USER_LIST[${user}]}"; then
+      online="true"
     fi
-  
+    presentWithDelay "user:${user}" ${online}
+    stat=${PRESENCE_RESULT}
+    userState[${user}]=${stat}
+
     if [[ ${stat} == "true" ]]; then
-      echo present
+      if [[ ${online} == "true" ]]; then
+        echo present
+      else
+        echo "present (last seen less than ${HM_AWAY_DELAY}s ago)"
+      fi
       if [[ -n ${presenceList} ]]; then
         presenceList+=","
       fi
@@ -740,39 +1236,48 @@ function run_pdetect()
     else
       echo away
     fi
-  
+
     # remove checked user devices from deviceList so that
     # they are not recognized as guest devices
-    for device in ${HM_USER_LIST[${user}]}; do
-      # try to match IP address first
-      if [[ ${!normalDeviceList[*]} =~ ${device^^} ]]; then
-        unset "normalDeviceList[${device^^}]"
-      elif [[ ${!guestDeviceList[*]} =~ ${device^^} ]]; then
-        unset "guestDeviceList[${device^^}]"
-      else
-        # now match the MAC address list instead
-        if [[ ${normalDeviceList[*]} =~ ${device^^} ]]; then
-          for dev in ${!normalDeviceList[@]}; do
-            if [[ ${normalDeviceList[${dev}]} == "${device^^}" ]]; then
-              unset "normalDeviceList[${dev}]"
-              break
-            fi
-          done
-        elif [[ ${guestDeviceList[*]} =~ ${device^^} ]]; then
-          for dev in ${!guestDeviceList[@]}; do
-            if [[ ${guestDeviceList[${dev}]} == "${device^^}" ]]; then
-              unset "guestDeviceList[${dev}]"
-              break
-            fi
-          done
-        fi
-      fi
+    for device in $(resolveDeviceEntries "${HM_USER_LIST[${user}]}"); do
+      removeFromDeviceLists "${device}"
     done
-  
+
     # set status in homematic CCU
     createVariable "${HM_CCU_PRESENCE_VAR}.${user}" bool "${user} @ home"
     setVariableState "${HM_CCU_PRESENCE_VAR}.${user}" ${stat}
   done
+
+  # monitored devices (e.g. computers) get their own online variable but
+  # are not counted as users and not recognized as guests
+  if [[ ${#HM_DEVICE_LIST[@]} -gt 0 ]]; then
+    echo "Checking device presence: "
+    while IFS= read -r devname; do
+      echo -n " ${devname}: "
+      online="false"
+      if isDeviceOnline "${HM_DEVICE_LIST[${devname}]}"; then
+        online="true"
+      fi
+      presentWithDelay "device:${devname}" ${online}
+      stat=${PRESENCE_RESULT}
+      deviceState[${devname}]=${stat}
+      if [[ ${stat} == "true" ]]; then
+        if [[ ${online} == "true" ]]; then
+          echo online
+        else
+          echo "online (last seen less than ${HM_AWAY_DELAY}s ago)"
+        fi
+      else
+        echo offline
+      fi
+      for device in $(resolveDeviceEntries "${HM_DEVICE_LIST[${devname}]}"); do
+        removeFromDeviceLists "${device}"
+      done
+      createVariable "${HM_CCU_PRESENCE_VAR}.${HM_CCU_PRESENCE_DEVICE}.${devname}" bool "${devname} online"
+      setVariableState "${HM_CCU_PRESENCE_VAR}.${HM_CCU_PRESENCE_DEVICE}.${devname}" ${stat}
+    done < <(printf '%s\n' "${!HM_DEVICE_LIST[@]}" | sort)
+  fi
+  saveLastSeen
   
   # now we set a separate users presence variable to true/false in case
   # any defined user is present
@@ -893,7 +1398,10 @@ function run_pdetect()
   else
     setVariableState "${HM_CCU_PRESENCE_VAR}" true
   fi
-  
+
+  # run enter/leave actions of rules whose condition changed
+  evaluateRules
+
   echo "== $(date) ==================================="
   echo
   
@@ -923,6 +1431,9 @@ while true; do
     # lets eval the user overridden variables
     # so that they take priority
     eval "${USERVARS}"
+  fi
+  if ! sourceRulesFile; then
+    result=${RETURN_FAILURE}
   fi
 
   # lets wait until the next execution round in case

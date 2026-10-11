@@ -15,8 +15,12 @@ This CCU-Addon allows to implement a general home presence detection system with
 * Support for FRITZ!Box/Repeater local network login with and without password
 * Possibility to remotely query FRITZ!-devices via https
 * Support for querying a dedicated guest-WiFi network
-* User device definition based on MAC and/or IP address
+* User device definition based on MAC and/or IP address or the device name known to the FRITZ! device (for phones using changing private MAC addresses)
 * Possibility to define multiple devices per user
+* Configurable away delay to bridge short WiFi drop-outs of phones
+* Monitored devices (e.g. computers) with their own online system variable that do not count as users
+* Rules to control CCU devices on presence changes (e.g. heating to 21°C when the office computer is online, at most 18°C when nobody is home) including restoring the previous heating settings
+* Web based status overview (presence, rules, heating channels, device list of the FRITZ! devices) and form based rule editor
 * Automatically generates all necessary CCU system variables
 * Additional String and Enum system variable to easily display the general presence status at home
 * Guest detection based on unknown devices being identified in a dedicated Guest-WiFi
@@ -74,6 +78,20 @@ This CCU-Addon allows to implement a general home presence detection system with
         /opt/hm_pdetect/hm_pdetect.sh
 
 8. If you want to automatically start hm_pdetect on system startup a startup script
+
+## Devices and rules
+Besides users, hm_pdetect can monitor further devices and run actions on the CCU whenever the presence situation changes. Devices and rules are stored in a separate file `hm_pdetect-rules.conf` next to `hm_pdetect.conf` (see [hm_pdetect-rules.conf.sample](hm_pdetect-rules.conf.sample)). On a CCU they are edited on the addon settings page in the section *Devices & rules*, either with the form based editor or in a text view. The file is re-read in every run, so changes take effect without a restart.
+
+A rule consists of a condition and the actions to run when the condition becomes true (enter) and when it becomes false again (leave):
+
+        [OfficePC_on]='device:OfficePC|temp:room:Office=21|restore'
+        [Nobody_home]='nobody|maxtemp:ALL=18|restore'
+
+* Conditions: `device:<Name>`, `user:<Name>`, `anyone`, `nobody`; combine with `&`, negate with `!`
+* Actions: `temp:<target>=<°C>`, `maxtemp:<target>=<°C>`, `auto:<target>`, `restore`, `set:<datapoint>=<value>`, `var:<sysvar>=<value>`, `prog:<program>`; separate several with `;`
+* Heating targets: `ALL`, `room:<room name>` or comma separated channel names/addresses
+
+Actions only run when a condition changes, so manual changes at a thermostat are kept until the next change. `temp` and `maxtemp` save the previous heating settings, which `restore` sets again. The rule state is kept in `hm_pdetect-rules.state` so that it survives restarts; on the first evaluation of a new rule only its state is recorded. Set `HM_RULES_DRYRUN=true` to only log the actions.
 
 ## Using 'system.Exec()'
 Instead of automatically calling hm_pdetect on a predefined interval one can also trigger its execution using the `system.Exec()` command within HomeMatic scripts on the CCU following the following syntax:
